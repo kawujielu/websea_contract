@@ -1,0 +1,110 @@
+
+import sys
+import traceback
+import time
+import asyncio
+sys.path.append('../..')
+from client.env_pro.rest.websea import contract
+
+
+class takeOverStrategy():
+
+    ''' ============================================================================'''
+    ''' =================================== init ==================================='''
+    ''' ============================================================================'''
+
+    def __init__(self):
+        self._load_config()         # 读取配置
+        self.symbol_pos = {}        # 交易对持仓
+        self.symbol_price = {}      # 交易对价格
+        self.symbol_size = {}       # 交易对合约单位
+        self.all_sum_amt = 0        # 所有账户总持仓的净金额
+        self.all_sum_amt_long = 0   # 所有账户总持仓的多单金额
+        self.all_sum_amt_short = 0  # 所有账户总持仓的空单金额
+
+    def _load_config(self):
+        self.rest1 = contract.WebseaContract('343d6405c5bceb820d47c502a3357775','9lbvo1ti1jlznd3czjwp')    # 近盘口19
+        self.rest2 = contract.WebseaContract('f92b5404bb7814170ab65caf3e3541c3','b3cihitxwlxpjoltntb1')    # 远盘口20
+        self.rest3 = contract.WebseaContract('e5a9248ff0051a647fa3b3228c9868f9','ghg628ioeqnnof5i1n5k')    # 补挡位21
+        self.rest4 = contract.WebseaContract('84ad0e771f0f5f2df264e56d0ecddef9','9cvay7ieczqp01lwy0zr')    # 刷量18
+        self.rest5 = contract.WebseaContract('3a4f68d2dce6a863ae7a0eb271cf6820','zvjnkwctuwtzhgstdgwz')    # 新策略 22
+        self.rest6 = contract.WebseaContract('44c614fa9131929291e4fa7325d47653000','v5eb4fwocsz4kyzejhd4')    # 压盘口策略
+        self.rest7 = contract.WebseaContract('9c09cc01ddb22536b80cf5526e0e0d08','r8b6uw0vojwtnpzuevt3')    # 防守策略 23
+        self.rest8 = contract.WebseaContract('5accd1fb1d03e26f299a4297d9q52646135','nyuc69aljff4g297uj99') # MH做市策略
+        self.rest9 = contract.WebseaContract('57b49384ee4e0b236f0f38a45fj50733190','bu8qqmoyaq0o10xeepdd')
+        # self.rest10 = contract.WebseaContract('3f57905a03a32432fae784037cb44f4c','sx4n8k2nh8hfz5gjs672')
+
+    ''' ============================================================================'''
+    ''' =============================== strategy ==================================='''
+    ''' ============================================================================'''
+    async def main(self):
+        data = await self.rest1.get_symbols()
+        for i in data:
+            self.symbol_size[i.symbol] = i.contract_size
+
+        for num, task in enumerate([self.rest1, self.rest2, self.rest3, self.rest4, self.rest5, self.rest6, self.rest7, self.rest8, self.rest9]):
+            await self.get_pos(task, num)
+        print(f"总持仓:{self.all_sum_amt} usdt 多单:{self.all_sum_amt_long} 空单:{self.all_sum_amt_short}")
+
+    async def get_pos(self, task, num):
+        pos = await task.get_position(quan=True)
+        #print(f"做市账户持仓:{pos}")
+        if pos is None:
+            return 0
+        symbol_pos = {}
+        for i in pos:
+            if i.type == 1:      # 多单
+                try:
+                    symbol_pos[i.symbol] += i.amount
+                except:
+                    symbol_pos[i.symbol] = i.amount
+                    self.symbol_price[i.symbol] = i.mark_price
+            elif i.type == 2:    # 空单
+                try:
+                    symbol_pos[i.symbol] -= i.amount
+                except:
+                    symbol_pos[i.symbol] = i.amount*-1
+                    self.symbol_price[i.symbol] = i.mark_price
+        pos_dict = {}
+        ll = []
+        amt_sum_long = 0
+        amt_sum_short = 0
+        for k, v in sorted(symbol_pos.items(), key=lambda x: abs(x[1]), reverse=True):
+            if v != 0 and self.symbol_price[k]:
+                pos_amt = round(v*self.symbol_size[k]*self.symbol_price[k])
+                self.all_sum_amt += pos_amt
+                if pos_amt > 0:
+                    self.all_sum_amt_long += pos_amt
+                else:
+                    self.all_sum_amt_short += pos_amt
+                if abs(pos_amt) > 0:
+                    ll.append(k)
+                    pos_dict[k] = [v, pos_amt]
+                    # mess += f"【{k}】:仓位{v}张 金额:{pos_amt}usdt\n"
+        # 按照字典vol是list的第二个值从大到小排序
+        pos_dict = {k: v for k, v in sorted(pos_dict.items(), key=lambda x: x[1][1], reverse=True)}
+        mess = ""
+        for s, p in pos_dict.items():
+            #if abs(p[1]) > 5000000:
+            mess += f"【{s}】:仓位{p[0]}张 金额:{p[1]}usdt\n"
+            
+        print(f"{num}账户持仓: \n{mess}\n{ll}")
+
+
+async def main():
+    task = takeOverStrategy()
+    while 1:
+        try:
+            await task.main()  # 主循环
+        except:
+            try:
+                print(f'策略报错!\n{traceback.format_exc()}')
+            except:
+                pass
+        time.sleep(60)
+
+asyncio.run(main())
+
+
+
+

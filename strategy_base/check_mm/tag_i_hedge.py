@@ -1,0 +1,349 @@
+'''
+    监控指定标签+指定uid用户的成交
+    若平仓则立即在外盘平仓
+'''
+
+import sys
+import time
+import datetime
+import requests
+import traceback
+import asyncio
+import json
+sys.path.append('../..')
+from utils import Toolbox as tb
+from utils import restclient as rc
+from template.template_timer import TemplateTimer, CronTrigger
+from client.env_pro.rest.websea.contract import WebseaContract as ws_contract_rest
+from client.env_pro.wss.websea.contract import WebSeaContract as ws_contract_wss
+from client.env_pro.rest.binance import u_contract as bn_rest
+from client.env_pro.wss.binance.u_contract import UBinanceContract as bn_wss
+import objects.contract_request.binance as ocb
+
+
+
+class Strategy(TemplateTimer):
+
+    ''' ============================================================================'''
+    ''' =================================== init ==================================='''
+    ''' ============================================================================'''
+
+    def __init__(self):
+        super().__init__(scheduler=True, gcc=True)
+        self.loop = asyncio.get_event_loop()
+
+        self._load_config()  # 读取配置
+        self._initParams()    # 初始化参数
+
+        # 订阅base数据
+        self.ws_wss = ws_contract_wss()
+        self.ws_wss.on_adl = self.on_adl
+        self.loop.create_task(self.ws_wss.only_subscribe())     # 必须写这个才能订阅
+        self.loop.create_task(self.ws_wss.sub_adl(subtag=self.tag))
+
+        # 订阅hedge数据
+        self.bn_wss = bn_wss()
+        self.bn_wss.on_ticker_order = self.on_ticker_order
+        self.timer_count: int = 0
+        self.loop.create_task(self.bn_wss.only_subscribe())     # 必须写这个才能订阅
+                
+    def _load_config(self):
+        """读取配置文件
+        """
+        # 配置账号
+        self.binance_rest = bn_rest.UBinanceContract('AZcNe2FG4SXf4SQDreEk98um8EtyDgHx82uPEZkdCp3ivU26mBWd0CXcrTqE0gAi','FRLuQbmdHUf5F1RubYvOgpkJn6C3q9jIcNfEVtm7ZoZTZBXZnDI1jFMxSbgOThkj')
+
+    def _initParams(self):
+        """初始化参数
+        """
+        self.tag = 'I'                      # 订阅的标记组用户
+        self.rc_task = rc.RestClient()
+        self.symbols_markprice = {}         # 保存内盘标记价格
+        self.contract_unit = {}             # 保存内盘合约单位
+        self.symbols_bid_ask = {}           # 保存外盘wss推送来的一档价格
+        self.deals_dict = {}                # 保存内盘成交数据
+        self.hedge_symbol_precision = {}    # 保存交易对精度
+        self.hedge_clock = False            # 对冲锁
+        self.risk_clock = False             # 风控锁
+        self.thisVol = 0                    # 本次下单量
+        self.split = 0.002                  # 下单滑点
+        self.send_tg_ts = 0                 # 发送tg时间戳
+        self.exposeRiskAmt = getattr(self, 'exposeRiskAmt', 5000*1.1)   # 净敞口报警
+    
+    async def on_first(self):
+        await self.hedge_contract_info()       # 更新币对信息
+
+    async def on_timer(self):
+        self.log.info("=======timer======")
+        self.schedule.add_job(self.handle_deals, CronTrigger(second="*/2"))  # 每1s执行一次
+        self.schedule.add_job(self.risk, CronTrigger(second="*/10"))  # 每1s执行一次
+    
+    ''' ==========================================================================='''
+    ''' ==================================== wss =================================='''
+    ''' ==========================================================================='''
+    
+    async def on_ticker_order(self, content):
+        # print(f"外盘一档数据:{content}")
+        symbol = content['symbol']
+        bid = content['bid_price']
+        ask = content['ask_price']
+        bid_vol = content['bid_qty']
+        ask_vol = content['ask_qty']
+        self.symbols_bid_ask[symbol] = [[bid, bid_vol], [ask, ask_vol]]
+
+    # 内盘wss成交推送
+    async def on_adl(self, content):
+        self.log.info(f"ws成交推送数据:{content}")
+        # 原始数据
+        # 平仓ws成交推送数据:{'lastfilledVolume': '', 'orderType': 'market', 'leverage': 20, 'lastfilledSize': '', 'isolatedMargin': '0.6002', 'liquidationPrice': '1094.25', 'cumfilledSize': '', 'uid': '', 'positionAmt': '-0.02', 'markPrice': '600.25', 'price': '', 'tag': 'A', 'direction': 'SPACE', 'side': 'BUY', 'origQty': 0.02, 'positionSide': 'SHORT', 'updateTime': 1729147616045, 'userId': 60142803, 'market': 'BNB-USDT', 'entryPrice': '600.50', 'cumfilledVol': '', 'isAutoAddMargin': 'false', 'unRealizedProfit': '0.005', 'marginType': 'full', 'lastfilledprice': '', 'status': 'NEW'}, <class 'dict'>
+        # 平仓ws成交推送数据:{'lastfilledVolume': 12.0, 'orderType': 'market', 'lastfilledSize': 0.02, 'side': 'BUY', 'origQty': 0.02, 'cumfilledSize': 0.02, 'userId': 60142803, 'market': 'BNB-USDT', 'uid': 0, 'cumfilledVol': '12.00', 'price': '', 'lastfilledprice': '600.41', 'tag': 'A', 'status': 'FILLED', 'direction': 'SPACE'}, <class 'dict'>
+        if content['tag'] == 'I' and \
+            content['market'] == 'BCH-USDT' and \
+            content['status'] in ['PARTIALLY_FILLED', 'FILLED'] and \
+            content['userId'] in [78320359]:
+            await self.deal_wss(dict(content))
+
+    # 内盘成交处理
+    async def deal_wss(self, content):
+        symbol = content['market']
+        if symbol in self.deals_dict:
+            self.deals_dict[symbol].append(content)
+        else:
+            self.deals_dict[symbol] = [content]
+
+    # rest获取对冲端交易对详情
+    async def hedge_contract_info(self):
+        data = await self.binance_rest.get_precision()
+        for k, v in data.items():
+            self.hedge_symbol_precision[k] = [v.price, v.amount]
+    
+    ''' ==========================================================================='''
+    ''' ===================================== risk ================================'''
+    ''' ==========================================================================='''
+
+    async def risk(self):
+        if self.risk_clock:
+            return
+        self.risk_clock = True
+        try:
+            text = 'binance持仓:\n'
+            # 获取外盘仓位
+            hedge_pos = await self.binance_rest.get_position()  # 仓位带正负
+            print(hedge_pos)
+            return
+            for k, v in hedge_pos.items():
+                if float(v['positionAmt']) != 0:
+                    text += f"{k}: {float(v['positionAmt'])}\n成本:{round(float(v['entryPrice']),2)} 当前价格:{round(float(v['markPrice']), 2)}\n杠杆:{v['leverage']} 爆仓价格:{round(float(v['liquidationPrice']), 2)}\n浮动盈亏:{round(float(v['unRealizedProfit']), 2)}\n"
+            self.log.info(f"{text}")
+            if time.time()-self.send_tg_ts > 600:
+                await self.rc_task.tg_warning(token='6431006677:AAFPjHsu3ZiowA8vyKYPmK8-b-XSPnBUu3Q',chat_id=-1002413824899,content=text)
+                self.send_tg_ts = int(time.time())
+        except:
+            self.log.error(f"风险验证报错 {traceback.format_exc()}")
+        self.risk_clock = False
+                
+    
+    ''' ==========================================================================='''
+    ''' ===================================== main ================================'''
+    ''' ==========================================================================='''
+    
+    async def handle_deals(self):
+        if self.hedge_clock:    # 正在对冲中
+            return
+        self.hedge_clock = True
+        self.t1 = time.time()*1000
+        matchs = self.deals_dict.copy()
+        for symbol, match in matchs.items():
+            # 按交易对并行处理对冲
+            if len(match) != 0:
+                try:
+                    await self.agg_deals(symbol, match)
+                except:
+                    pass
+        self.hedge_clock = False
+    
+    # 聚合
+    async def agg_deals(self, symbol, matchs):
+        match_amt = 0   # 计算聚合成交金额
+        match_size = 0  # 计算聚合成交量
+        length = len(matchs)    # 聚合的订单数量
+        deals_mess = ''
+        for match in matchs:
+            temp = match
+            deals_mess += str(match)+'\n'
+            side = 'LONG' if match['side'] == 'BUY' else 'SHORT'  # 方向
+            deal_amt = float(match['cumfilledVol']) if side == 'LONG' \
+                 else -float(match['cumfilledVol'])  # 成交金额
+            match_amt += deal_amt
+            deal_size = float(match['amount']) if side == 'LONG' \
+                  else -float(match['amount'])  # 成交数量
+            match_size += deal_size
+
+        if match_size != 0:
+            # await self.bn_wss.sub_ticker_order(symbol=symbol)
+            self.log.info(f"聚合的订单信息:{deals_mess}")
+            match_price = match_amt/match_size   # 成交均价
+            
+            # 调整对冲量
+            match_size = match_size*getattr(self, 'follow_ratio', 1)
+
+            # 下单
+            try:
+                await self.hedge(symbol, match_size, match_price)
+                self.deals_dict[symbol] = self.deals_dict[symbol][length:]  # 已完全对冲后,删除已对冲部分的订单
+                self.hedge_clock = False
+                self.log.info(f"对冲耗时:{time.time() * 1000 - self.t1}ms")
+            except KeyboardInterrupt as e:   # 修改
+                self.hedge_clock = False
+                self.log.error(f"手动停止 {traceback.format_exc()}")
+                raise e
+            except:
+                self.hedge_clock = False
+                self.log.error((f'此条pendingTask处理失败! {traceback.format_exc()}'))
+                #temp['side'] = 'BUY' if self.thisVol > 0 else 'SELL'
+                #temp_amt = abs(self.thisVol)*float(temp['entryPrice'])
+                #temp['amount'] = abs(self.thisVol)
+                #temp['cumfilledVol'] = temp_amt
+                self.deals_dict[symbol] = self.deals_dict[symbol][length:]
+                #self.deals_dict[symbol].append(temp)
+                tb.warning(f"单独I组用户{symbol}合约对冲策略hedge报错:hedge函数报错信息:{traceback.format_exc()}", 'risk')
+                tb.sendmail(f'单独I组用户{symbol}合约对冲策略hedge报错', f"hedge函数报错信息:{traceback.format_exc()}")
+    
+    # 对冲
+    async def hedge(self, symbol, vol, cost):
+        t1 = time.time()*1000
+        tempLog = ''
+        hedgeMess = ''
+        symbol = symbol.replace('-', '')
+        # 更新交易对精度
+        while True:
+            if symbol in self.hedge_symbol_precision:
+                api_price_precision = self.hedge_symbol_precision[symbol][0]
+                api_vol_precision = self.hedge_symbol_precision[symbol][1]
+                break
+            else:
+                await self.hedge_contract_info()
+            await asyncio.sleep(1)
+        restVol = vol - round(vol, api_vol_precision)    # 表示精度以外的余量,要本地化,用于之后对冲量的加总
+        self.log.info(f"本地化的不可对冲小数部分:{restVol}")
+
+        # 小于最小对冲量的处理
+
+        if True:
+            vol = round(vol, api_vol_precision)
+            hedgeMess += f"需要外盘对冲 {vol}\n"
+            hedge_vol = 0   # 已对冲数量
+            while 1:
+                thisVol = round(vol - hedge_vol, api_vol_precision) if api_vol_precision > 0 else int(
+                    vol - hedge_vol)
+                self.thisVol = thisVol
+                hedgeMess += f"下单量{thisVol} 总成交量{hedge_vol}\n"
+
+                # 获取binance最新一档价格,改用wss
+                depth = await self.binance_rest.get_bookTicker(symbol=symbol)
+                bid = float(depth['bidPrice'])
+                ask = float(depth['askPrice'])
+                bid_vol = float(depth['bidQty'])
+                ask_vol = float(depth['askQty'])
+                self.log.info(f"rest一档价格:{bid} {ask}")
+
+                # 获取外盘订阅到的一档价格
+                # while True:
+                #     try:
+                #         bid, ask = self.symbols_bid_ask[symbol][0][0], self.symbols_bid_ask[symbol][1][0]
+                #         bid_vol, ask_vol = self.symbols_bid_ask[symbol][0][1], self.symbols_bid_ask[symbol][1][1]
+                #         self.log.info(f"wss一档价格:{bid} {ask}")
+                #         break
+                #     except:
+                #         await self.bn_wss.sub_ticker_order(symbol=symbol)
+                #     await asyncio.sleep(2)
+                
+                # 判断价格精度和数量精度是否跟接口返回不一致,不一致用一档拿到的数据
+                def count_unit(number):
+                    number_str = str(number)
+                    decimal_index = number_str.find('.')
+                    if decimal_index == -1:
+                        return 0
+                    return len(number_str) - decimal_index - 1
+                bid_price_unit = count_unit(bid)
+                ask_price_unit = count_unit(ask)
+                bid_vol_unit = count_unit(bid_vol)
+                ask_vol_unit = count_unit(ask_vol)
+                price_precision = min(api_price_precision, max(bid_price_unit, ask_price_unit))
+                vol_precision = min(api_vol_precision, max(bid_vol_unit, ask_vol_unit))
+                if api_price_precision != price_precision or api_vol_precision != vol_precision:
+                    self.log.info(f"{symbol}\n接口获取到的价格精度:{api_price_precision} 数量精度:{api_vol_precision}\n"
+                                  f"盘口获取到的价格精度:{price_precision} 数量精度:{vol_precision}")
+                
+                if vol > 0:
+                    bidPrice = round(ask*(1+self.split), price_precision)
+                    if (bidPrice / cost - 1) > getattr(self, 'hedgePriceLimit', 0.03):   # 对冲不及时会出现这种情况
+                        self.log.info(
+                            f"{symbol}下单价{bidPrice}超过成交价{cost}限价范围{getattr(self, 'hedgePriceLimit', 0.03) * 100}% 重试")
+                        
+                        await asyncio.sleep(0.2)
+                        continue
+                    hedgeMess += f"交易对:{symbol} 对冲价格:{bidPrice}  对冲数量:{thisVol}  方向:buy  本地化的不可对冲小数部分:{restVol}\n"
+                    self.log.info(f"最终下单参数:{hedgeMess}")
+                    # return
+                    t11 = time.time()*1000
+                    result = await self.binance_rest.order_create(symbol=symbol, side='BUY', orderType=ocb.OrderType.LIMIT, 
+                                                            amount=abs(thisVol), price=bidPrice)
+                    tempLog += f"buy下单延时:{round(time.time()*1000-t11, 2)}ms  "
+                elif vol < 0:
+                    askPrice = round(bid*(1-self.split), price_precision)
+                    if (askPrice / cost - 1) < -getattr(self, 'hedge_price_limit', 0.03):    # 对冲不及时会出现这种情况
+                        self.log.info(
+                            f"{symbol}下单价{askPrice}超过成交价{cost}限价范围{getattr(self, 'hedgePriceLimit', 0.03) * 100}% 重试")
+                        await asyncio.sleep(self.loop_time)
+                        continue
+                    hedgeMess += f"交易对:{symbol} 对冲价格:{askPrice}  对冲数量:{thisVol}  方向:sell  本地化的不可对冲小数部分:{restVol}\n"
+                    self.log.info(f'最终下单参数:{hedgeMess}')
+                    # return
+                    t11 = time.time()*1000
+                    result = await self.binance_rest.order_create(symbol=symbol, side='SELL', orderType=ocb.OrderType.LIMIT, 
+                                                            amount=abs(thisVol), price=askPrice)
+                    tempLog += f"sell下单延时:{round(time.time()*1000-t11, 2)}ms  "
+                hedge_order_id = result.order_id
+                self.log.info(f"对冲下单 {result} 延时:{round(time.time()*1000-t11, 2)}ms hedge_order_id:{hedge_order_id}")
+
+                t33 = time.time()*1000
+                try:
+                    cancelRes = await self.binance_rest.order_cancel(symbol, orderId=hedge_order_id)
+                    self.log.info(f"撤单 {cancelRes}")
+                except:
+                    self.log.error(f"撤单报错{traceback.format_exc()}")
+                tempLog += f"撤单延时:{round(time.time()*1000-t33, 2)}ms  "
+                
+                t44 = time.time()*1000
+                while 1:  # 等待ws回调函数到达
+                    # 查询接口
+                    content = await self.binance_rest.order_detail(symbol, hedge_order_id)
+                    self.log.info(f"对冲订单状态:{content}")
+                    if content.status in ['FILLED', 'CANCELED', 'PARTIALLY_FILLED', 'REJECTED']:
+                        # hedge_vol += content['data']['matchVol'] if content['data']['side'] == 'buy' else - \
+                        #     content['data']['matchVol']
+                        hedge_vol = content.deal_amount
+                        hedge_vol = round(hedge_vol, vol_precision)
+                        break
+                    await asyncio.sleep(0.05)
+
+                tempLog += f"验证订单状态耗时:{round(time.time()*1000-t44, 2)}ms  "
+                t55 = time.time()*1000
+                if abs(hedge_vol) >= abs(vol):
+                    print(f"{symbol}对冲完全成交")
+                    tempLog += f"循环后跳出前耗时:{round(time.time()*1000-t55, 2)}ms\n"
+                    break
+                await asyncio.sleep(0.05)
+            self.log.info(tempLog)
+
+
+def main():
+    task = Strategy().run()
+    while True:
+        time.sleep(999999)
+
+
+
+if __name__ == '__main__':
+    main()
