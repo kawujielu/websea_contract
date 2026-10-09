@@ -1,0 +1,1001 @@
+'''
+    压盘口策略
+    版本信息:v1.0.0
+    日期:2025-11-07
+    作者:sky
+
+    替换为新接口
+'''
+
+import os
+import sys
+import random
+sys.path.append('../..')
+from typing import Optional, Dict, List
+import time
+from datetime import datetime, timedelta
+import math
+import traceback
+import importlib
+import asyncio
+import pytz
+from collections import OrderedDict
+from dataclasses import dataclass
+from utils import Toolbox as tb
+from utils import restclient as rc
+from template.template_timer import TemplateTimer, CronTrigger
+from utils.some_array import FixedSizeOrderedList
+from crypto_center.client.rest.websea.contract_pro import WebseaContractNew as Contract  # 新合约接口
+from crypto_center.client.rest.binance.u_contract import UBinanceContract as bn_rest
+
+from utils.aio_redis import MyAioredis, MyAioredisFunctools
+# from client.env_dev.rest.websea_contract import WebseaContract as ws_contract_rest    # 测试环境
+# from client.env_dev.wss.websea_contract import WebSeaContract as ws_contract_wss      # 测试环境
+# from client.env_pro.rest.binance import u_contract as bn_rest
+# from client.env_pro.wss.binance.u_contract import UBinanceContract as bn_wss
+sys.path.append("/usr/local/server/wbfAPI/exchange")
+from binanceUsdtSwap import AccountRest
+
+timezone = pytz.timezone("Asia/Shanghai")
+
+
+class LimitedSizeDict(OrderedDict):
+    def __init__(self, *args, max_size=100, **kwargs):
+        self._max_size = max_size
+        super().__init__(*args, **kwargs)
+        
+    def __setitem__(self, key, value):
+         # 如果字典已满，则先删除最早的项
+        while len(self) >= self._max_size:
+            self.popitem(last=False)
+        super().__setitem__(key, value)
+
+# noinspection DuplicatedCode
+@dataclass
+class BpRow:
+    side: str                        # 方向
+    start_ts: int = -1               # 冲击开始时间
+    end_ts: int = -1                 # 冲击结束时间
+    breaking_ts: int = -1            # 突破时间
+    setback_type: int = 0            # 冲击结束方式
+    open_price: float = -1           # 冲击开始价格
+    breaking_price: float = -1       # 突破价格
+    setback_price: float = -1        # 冲击转向价格
+    close_price: float = -1          # 冲击结束价格
+    breaking_qty: float = 0          # 突破总量
+    cum_shocking_qty: float = 0      # 冲击总量
+    cum_chopping_ask_qty: float = 0  # ask震荡总量
+    cum_chopping_bid_qty: float = 0  # bid震荡总量
+
+    def to_dict(self):
+        return {
+            "side": self.side,
+            "start_ts": str(self.start_ts),
+            "start_time": datetime.fromtimestamp(self.start_ts / 1000, tz=timezone).strftime("%Y-%m-%d %H:%M:%S"),
+            "end_ts": str(self.end_ts),
+            "end_time": datetime.fromtimestamp(self.end_ts / 1000, tz=timezone).strftime("%Y-%m-%d %H:%M:%S"),
+            "breaking_ts": str(self.breaking_ts),
+            "breaking_time": datetime.fromtimestamp(self.breaking_ts / 1000, tz=timezone).strftime("%Y-%m-%d %H:%M:%S"),
+            "setback_type": str(self.setback_type),
+            "open_price": str(self.open_price),
+            "breaking_price": str(self.breaking_price),
+            "setback_price": str(self.setback_price),
+            "close_price": str(self.close_price),
+            "breaking_qty": str(self.breaking_qty),
+            "cum_shocking_qty": str(self.cum_shocking_qty),
+            "cum_chopping_ask_qty": str(self.cum_chopping_ask_qty),
+            "cum_chopping_bid_qty": str(self.cum_chopping_bid_qty),
+        }
+
+
+class strategy(TemplateTimer):
+
+    ''' ============================================================================'''
+    ''' =================================== init ==================================='''
+    ''' ============================================================================'''
+    def __init__(self, config):
+        super().__init__(scheduler=True, gcc=True)
+        self.redis_pool: Optional[MyAioredis] = None
+        self.redis_conn: Optional[MyAioredisFunctools] = None
+        self.db = 1
+        self._load_config(config)  # 读取配置
+        self._initParams()         # 初始化参数
+    
+    async def on_first(self):
+        self.log.info("=======first======")
+        # 设置日志
+        script_name = os.path.splitext(os.path.basename(sys.argv[0]))[0]
+        log_file = f"log/{script_name}.log"
+        self.log.add(log_file, rotation="100 MB", retention=10)
+
+        # 连接redis推送
+        self.redis_pool = MyAioredis(db=self.db)
+        self.redis_conn = await self.redis_pool.open()
+        self.loop.create_task(self.redis_conn.subscribe_async(channel=[], callback=self.on_message))
+        await asyncio.sleep(1)
+        await self.redis_conn.sub_channel(f"contract.bids_asks.{self.symbol}.websea")   # TODO 没有数据推送
+        await self.redis_conn.sub_channel(f"contract.bids_asks.{self.symbol}.binance")
+        await self.redis_conn.sub_channel(f"contract.kline.1m.{self.symbol}.binance")
+        await self.redis_conn.sub_channel(f"contract.order.websea.{self.symbol}.{self.token}")
+        self.log.info(f"订阅:{self.symbol}一档价格")
+        
+        self.refer_price = 0                # 上次成交价格
+        self.hedge_symbol = self.symbol.replace('-','/').lower()
+        await self.get_precision()          # 内盘精度
+        await self.hedge_contract_info()    # 外盘精度
+        depth = await self.rest.fetch_depth(self.symbol, limit=5)
+        self.bid1_wb = float(depth['bids'][0][0])
+        self.ask1_wb = float(depth['asks'][0][0])
+        trade = await self.bn_rest.fetch_trade(self.hedge_symbol)
+        await self.update_benchmark_price([trade[0]['timestamp'], trade[0]['price'], trade[0]['side']])
+        await self.update_kline()
+        await self.update_range()
+        await self.cancel_orders(tag='开盘撤单')
+        self.base_balance = self.use_balance
+        await asyncio.sleep(5)
+        await self.risk()
+
+    async def on_timer(self):
+        self.log.info("=======timer======")
+        self.schedule.add_job(self.update_range, CronTrigger(second="*/1"))  # 每1s执行一次
+        self.schedule.add_job(self.check_wss, CronTrigger(second="*/5"))     # 每5s执行一次
+        self.schedule.add_job(self.risk, CronTrigger(minute="*"))            # 每10s执行一次
+        self.schedule.add_job(self.update_kline, CronTrigger(second="00"))   # 每分钟的0s执行
+        self.schedule.add_job(self.reload_config, CronTrigger(second="00"))  # 每分钟的0s执行
+
+    def _load_config(self, config):
+        """读取配置文件
+        """
+        config = __import__(config)
+        self.init_config = config
+        # 配置全局变量
+        [setattr(self, k, v) for k, v in vars(config).items()]        # 批量生成所有参数
+        config = config.config
+        # 配置账号
+        self.rc_task = rc.RestClient()
+        self.token = config['token']
+        self.rest = Contract(config['token'], config['secret'])
+        self.bn_rest = bn_rest(config['hedge_token'], config['hedge_secret'])
+
+    def _initParams(self):
+        """初始化参数
+        """
+        self.shock_dodge_last = 0           # 上次盘口后移价格
+        self.signal1_last = 0               # 上次信号方向
+        self.signal_last = 0
+        self.last_current_position = 0      # 上次持仓
+        self.hedge_symbol_precision = {}    # 保存binance合约信息
+        self.symbols_1000 = []              # 保存binanc名称包含1000的交易对
+        self.last_on_kline_ts = 0           # 最后一次kline推送时间戳
+        self.last_on_bid_ask_ts = 0         # 最后一次bid_ask推送时间戳
+        self.last_on_depth_ts = 0           # 最后一次depth推送时间戳
+        self.local_open_buy_list = []       # 本地保存buy委托数据
+        self.local_open_sell_list = []      # 本地保存sell委托数据
+        self.buy_is_open = True             # 是否开仓,False表示下平仓单
+        self.sell_is_open = True            
+        self.main_clock = False             # 下单循环加锁
+        self.buy_shocking = 0               # buy挂单后移
+        self.sell_shocking = 0              # sell挂单后移
+        
+        self.buy_shape = self.default_shape
+        self.sell_shape = self.default_shape
+        self.bid_spread = 0                 # 盘口价格往后挪多少
+        self.ask_spread = 0                 # 盘口价格往后挪多少
+        self.kline_dict = LimitedSizeDict(max_size=70)    # 保存kline
+        self.pos_WB = 0                     # websea持仓量
+        self.send_tg_ts = 0                 # 发送tg时间戳
+        self.last_ts = 0                    # 保存上次时间戳
+        self.last_ctime = 0                 # 保存最新交易时间戳
+        self.deal_num = 0                   # 统计周期内成交笔数
+        self.deal_amt = 0                   # 统计周期内成交金额
+
+        # 计算冲击成本
+        # depth
+        self.ask1: float = -1
+        self.bid1: float = -1
+        # trade
+        self.trades: List[dict] = FixedSizeOrderedList(1000)
+        self.bp_rows: List[BpRow] = []
+        self.shocking: bool = False             # 是否开始冲击
+        
+        # 统计成交情况
+        self.role22 = 0
+        self.roleself = 0
+        self.roleother = 0
+
+    # 内盘合约信息
+    async def get_precision(self):
+        self.precision = await self.rest.fetch_precision(self.symbol)
+        self.log.info(f"币对信息:{self.precision}")
+        self.symbol_unit = self.precision[self.symbol]['faceValue']      # 合约单位
+        self.price_unit = int(self.precision[self.symbol]['price'])      # 合约价格单位
+        self.amount_unit = int(self.precision[self.symbol]['amount'])    # 合约数量单位
+        self.min_price_step = 10 ** (-self.precision[self.symbol]['price'])
+        if self.symbol == "BTC-USDT":
+            self.min_price_step = 0.1
+    
+    # 外盘合约信息
+    async def hedge_contract_info(self):
+        data = await self.bn_rest.fetch_precision(self.symbol)
+        for k, v in data.items():
+            if '1000' in k:
+                self.symbols_1000.append(k.lstrip('1000'))
+            self.hedge_symbol_precision[k] = [v['price'], v['amount']]
+        self.log.info(f"binance合约信息:{self.hedge_symbol_precision[self.symbol]}")
+
+    async def cancel_orders(self, orders=None, tag=''):
+        while True:
+            try:
+                t1 = time.time()*1000
+                if orders is None:
+                    res = await self.rest.cancel_order_batch(symbol=self.symbol)
+                else:
+                    res = await self.rest.cancel_order_batch(client_order_id=orders)
+                self.log.info(f"内盘撤单:{res} 耗时:{round(time.time()*1000-t1, 2)}ms")
+                break
+            except Exception as e:
+                self.log.warning(f"{tag}撤单错误:{traceback.format_exc()}")
+            await asyncio.sleep(2)
+    
+    def adjust_precision(self, number, unit):
+        factor = 10 ** unit
+        return int(number * factor) / factor
+
+    async def reload_config(self):
+        try:
+            importlib.reload(self.init_config)
+            [setattr(self, k, v) for k, v in vars(self.init_config).items()]
+        except:
+            try:  # 异常处理
+                self.log.warning(f"reload_config报错{traceback.format_exc()}")
+            except:
+                pass
+            
+    ''' ==========================================================================='''
+    ''' ===================================== wss ================================='''
+    ''' ==========================================================================='''
+    async def on_message(self, channel: str, item: dict):
+        # self.log.info(f"redis推送:{channel}, {item}")
+        if f"order.websea.{self.symbol}" in channel:
+            if item['dealRole'] == 100022:
+                self.role22 += item['filled']
+            elif item['dealRole'] == 476515:
+                self.roleself += item['filled']
+            else:
+                self.roleother += item['filled']
+        elif f"contract.bids_asks" in channel and 'websea' in channel:
+            self.bid1_wb = item['bid']
+            self.ask1_wb = item['ask']
+            self.last_on_depth_ts = item['timestamp']
+        elif f"contract.bids_asks" in channel and 'binance' in channel:
+            self.bn_bid_price = item['bid']
+            self.bn_ask_price = item['ask']
+            self.last_on_bid_ask_ts = item['timestamp']
+            median_price = (self.bn_bid_price + self.bn_ask_price) / 2
+            side = 1 if median_price >= getattr(self, 'median_price', 0) else -1
+            item = [item['timestamp'], median_price, side]
+            self.loop.create_task(self.update_benchmark_price(item))
+            self.median_price = median_price
+        elif f"contract.kline" in channel and 'binance' in channel:
+            self.kline_dict[item['timestamp']] = [item['high'], item['low']]
+            self.kline_price = list(self.kline_dict.values())
+            self.last_on_kline_ts = item['timestamp']
+    
+    # 检查wss推送是否正常
+    async def check_wss(self):
+        # 外盘数据
+        if time.time() - self.last_on_kline_ts/1000 > 30:
+            mess = f"压盘口策略{self.symbol},on_kline数据wss推送异常,重新订阅"
+            self.log.info(mess)
+            tb.warning(mess, 'risk')
+        # 外盘数据
+        if time.time() - self.last_on_bid_ask_ts/1000 > 30:
+            mess = f"压盘口策略{self.symbol},on_bid_ask数据wss推送异常,重新订阅"
+            self.log.info(mess)
+            tb.warning(mess, 'risk')
+        # 内盘数据
+        if time.time() - self.last_on_depth_ts/1000 > 30:
+            mess = f"压盘口策略{self.symbol},on_depth数据wss推送异常,重新订阅"
+            self.log.info(mess)
+            tb.warning(mess, 'risk')
+
+
+    ''' ==========================================================================='''
+    ''' =================================== bp_mm ================================='''
+    ''' ==========================================================================='''
+
+    async def handle_trade(self, item: dict):
+        """
+        {'symbol': 'ETH-USDT', 'price': 3696.22, 'amount': 0.24, 'cost': 887.0928, 'side': 'sell', 'timestamp': 1734615121759}
+        """
+        if -1 in (self.ask1, self.bid1):
+            return
+        side = 'buy' if item[0][-1] == 1 else 'sell'
+        temp_item = {'symbol':self.symbol, 'price':item[0][1], 'amount':item[0][2], 'side':side, 'timestamp':item[0][0]}
+        item = temp_item
+        if not self.trades:
+            self.trades.insert(0, item)
+            return
+        try:
+            # 本条数据未结束
+            if self.bp_rows[-1].end_ts == -1:
+                bp = self.bp_rows.pop()
+            # 初始化新数据
+            else:
+                bp = BpRow(side=item["side"])
+                last_bp = self.bp_rows[-1]
+                if 0 not in (last_bp.cum_chopping_ask_qty, last_bp.cum_chopping_bid_qty):
+                    self.log.info(000, last_bp)
+                # self.log.info(000, self.bp_rows[-1])
+        except IndexError:
+            bp = BpRow(side=item["side"])
+        self.bp_rows.append(bp)
+        if (side := bp.side) == "sell":
+            if abs((price := item["price"]) / self.bid1 - 1) > 0.002:
+                return
+            await self.on_asks(side=side, price=price, amount=item["amount"], crt=item, last=self.trades[0], bp=bp)
+        else:
+            if abs((price := item["price"]) / self.ask1 - 1) > 0.002:
+                return
+            await self.on_bids(side=side, price=price, amount=item["amount"], crt=item, last=self.trades[0], bp=bp)
+        # 历史交易数据(倒序)
+        self.trades.insert(0, item)
+
+    async def on_asks(self, side: str, price: float, amount: float, crt: dict, last: dict, bp: BpRow):
+        if (price > (last_price := last["price"])) and (side == last["side"]) and (self.shocking is False):
+            self.shocking = True
+            bp.open_price = last_price
+            bp.breaking_price = price
+            bp.start_ts = last["timestamp"]
+            bp.cum_shocking_qty = amount
+            bp.breaking_qty = 0
+            # 记录突破过程量
+            for trade in self.trades:
+                if (price == last_price) and (side == last["side"]):
+                    bp.breaking_qty += trade["amount"]
+                else:
+                    bp.breaking_ts = trade["timestamp"]
+                    break
+        if self.shocking is False:
+            bp.cum_chopping_ask_qty += amount
+        # 冲击开始
+        if self.shocking is True:
+            # 方向转向
+            if side != last["side"]:
+                self.shocking = False
+                bp.setback_type = 1
+                bp.setback_price = price
+                bp.close_price = max(last_price, price)
+                bp.end_ts = last["timestamp"]
+                await self.update_shock_dodge(bp)
+            # 价格转向
+            elif side == last["side"] and price < last_price:
+                self.shocking = False
+                bp.setback_type = 2
+                bp.setback_price = price
+                bp.close_price = last_price
+                bp.end_ts = last["timestamp"]
+                await self.update_shock_dodge(bp)
+            # 持续冲击
+            else:
+                bp.cum_shocking_qty += amount
+        # 暂存本条数据
+        self.bp_rows[-1] = bp
+
+    async def on_bids(self, side: str, price: float, amount: float, crt: dict, last: dict, bp: BpRow):
+        if (price < (last_price := last["price"])) and (side == last["side"]) and (self.shocking is False):
+            self.shocking = True
+            bp.open_price = last_price
+            bp.breaking_price = price
+            bp.start_ts = last["timestamp"]
+            bp.cum_shocking_qty = amount
+            bp.breaking_qty = 0
+            for trade in self.trades:
+                if (price == last_price) and (side == last["side"]):
+                    bp.breaking_qty += trade["amount"]
+                else:
+                    bp.breaking_ts = trade["timestamp"]
+                    break
+        if self.shocking is False:
+            bp.cum_chopping_bid_qty += amount
+        # 冲击开始
+        if self.shocking is True:
+            # 方向转向
+            if side != last["side"]:
+                self.shocking = False
+                bp.setback_type = 1
+                bp.setback_price = price
+                bp.close_price = min(last_price, price)
+                bp.end_ts = last["timestamp"]
+                await self.update_shock_dodge(bp)
+            # 价格转向
+            elif side == last["side"] and price > last_price:
+                self.shocking = False
+                bp.setback_type = 2
+                bp.setback_price = price
+                bp.close_price = last_price
+                bp.end_ts = last["timestamp"]
+                await self.update_shock_dodge(bp)
+            # 持续冲击
+            else:
+                bp.cum_shocking_qty += amount
+        self.bp_rows[-1] = bp
+    
+        
+    ''' ==========================================================================='''
+    ''' ===================================== risk ================================'''
+    ''' ==========================================================================='''
+    async def risk(self):
+        try:
+            self.base_balance = self.use_balance
+            res = await self.rest.fetch_balance(self.symbol)
+            self.log.info(f"账户权益:{res}") # 没有资金
+
+            now = datetime.now()
+            now = now + timedelta(hours=8)
+            # 天时间戳
+            today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            tomorrow_midnight = today_midnight + timedelta(days=1)
+            tomorrow_ts = int(tomorrow_midnight.timestamp())    # 10位时间戳
+            today_date = int(today_midnight.timestamp())
+
+            if self.last_ts == 0:
+                self.last_ts = tomorrow_ts
+            if self.last_ts != tomorrow_ts:
+                text = f"{today_date} websea内盘{self.symbol}合约 成交额:{self.deal_amt}u 共{self.deal_num}笔\n(包含压盘口策略所有成交,需减去风控给出和普通用户成交部分,才是量化账户间成交金额)"
+                await self.rc_task.tg_warning(token='6431006677:AAFPjHsu3ZiowA8vyKYPmK8-b-XSPnBUu3Q', chat_id=-1002413824899, content=text)
+                self.last_ts = tomorrow_ts
+                self.deal_num = 0
+                self.deal_amt = 0
+                
+            res = await self.rest.fetch_history_list(self.symbol, direct='prev', limit = 100)
+            # print(f"历史成交:{res}")
+            for v in res:
+                if v['timestamp'] > self.last_ctime:   # v.ctime是10位时间戳
+                    self.deal_num += 1
+                    self.deal_amt += v['average'] * v['filled'] * self.symbol_unit
+            self.last_ctime = res[0]['timestamp']
+            self.log.info(f"{self.symbol}成交{self.deal_num}笔,金额:{self.deal_amt}\n最新成交时间戳:{self.last_ctime} 明天0点时间戳:{tomorrow_ts}")
+            
+            # 当前委托
+            open_buy_vol = 0
+            open_sell_vol = 0
+            temp_open_buy = []
+            temp_open_sell = []
+            open_orders = await self.rest.fetch_current_list(self.symbol, limit=1000, direct='prev')
+            self.log.info(f"当前委托:{open_orders}")
+            open_orders = open_orders if open_orders else []
+            buy_pirce, sell_price = [], []
+            for order in open_orders:
+                deal_amount = 0 if order['filled'] is None else order['filled']
+                if order['side'] == 'buy':
+                    buy_pirce.append(order['price'])
+                    open_buy_vol += order['amount']-deal_amount
+                    temp_open_buy.append([order['price'], order['clientOrderId'], order['amount']])
+                else:
+                    sell_price.append(order['price'])
+                    open_sell_vol += order['amount']-deal_amount
+                    temp_open_sell.append([order['price'], order['clientOrderId'], order['amount']])
+            open_buy_vol *= self.symbol_unit
+            open_sell_vol *= self.symbol_unit
+            self.local_open_buy_list = temp_open_buy
+            self.local_open_sell_list = temp_open_sell
+
+            # 当前持仓
+            pos_data = await self.rest.fetch_position(self.symbol)
+            print(f"当前持仓:{pos_data}")
+            current_position = 0
+            buy_pos, sell_pos = 0, 0
+            for i in pos_data:
+                if i['symbol'] == self.symbol:
+                    if i['side'] == 'long':
+                        buy_pos += i['contracts']/self.symbol_unit
+                        current_position += i['contracts']/self.symbol_unit
+                        self.pos_WB += i['contracts']*self.symbol_unit
+                    else:
+                        sell_pos += i['contracts']/self.symbol_unit
+                        current_position -= i['contracts']/self.symbol_unit
+                        self.pos_WB -= i['contracts']*self.symbol_unit
+            deviation = getattr(self, 'deviation', 0)
+            if buy_pos > self.is_close_pos:
+                self.sell_is_open = False
+            if sell_pos > self.is_close_pos:
+                self.buy_is_open = False
+            if buy_pos < self.is_open_pos:
+                self.sell_is_open = True
+            if sell_pos < self.is_open_pos:
+                self.buy_is_open = True
+            self.log.info(f"buy开仓:{self.buy_is_open} sell开仓:{self.sell_is_open}")
+
+            max_buy = max(buy_pirce) if buy_pirce else 0
+            min_sell = min(sell_price) if sell_price else 0
+            diff_ratio = round((min_sell-max_buy)/((min_sell+max_buy)/2)*100, 2) if max_buy and min_sell else '缺少挂单数据'
+            try:
+                arb1_ratio = round((max_buy/self.bn_ask_price-1)*100, 2)
+                arb2_ratio = round((self.bn_bid_price/min_sell-1)*100, 2) if min_sell else '缺少数据'
+            except:
+                pass
+            try:
+                local_max_buy = round(max([i[0] for i in self.local_open_buy_list]),2)
+            except:
+                local_max_buy = 0
+            try:
+                local_min_sell = round(min([i[0] for i in self.local_open_sell_list]),2)
+            except:
+                local_min_sell = 0
+            self.log.info(f"\n一档价差:{round(min_sell-max_buy, int(self.precision[self.symbol]['price']))} {diff_ratio}% \n"
+                        f"buy:{local_max_buy}({max_buy})({self.bn_bid_price}) sell:{local_min_sell}({min_sell})({self.bn_ask_price}) \n"
+                        f"正套:{arb1_ratio}% 反套:{arb2_ratio}% \n"
+                        f"buy档位数:{len(buy_pirce)} sell档位数:{len(sell_price)} \n"
+                        f"当前多单持仓:{buy_pos} 空单持仓:{-sell_pos} 净持仓:{current_position}\n")
+            
+            if time.time()-self.send_tg_ts > 60*60*3:  # or (current_position != self.last_current_position and time.time()-self.send_tg_ts > 600):
+                text = f"websea内盘{self.symbol}\nbuy档位数:{len(buy_pirce)} 币:{round(open_buy_vol,2)} sell档位数:{len(sell_price)} 币:{round(open_sell_vol,2)} \n" \
+                    f"多头持仓:{buy_pos} 空头持仓:{-sell_pos} 净持仓:{current_position}"
+                # await self.rc_task.tg_warning(token='6431006677:AAFPjHsu3ZiowA8vyKYPmK8-b-XSPnBUu3Q', chat_id=-1002413824899, content=text)
+                self.send_tg_ts = int(time.time())
+
+            if current_position != self.last_current_position or deviation == 0:
+                await self.update_deviation(current_position, open_buy_vol, open_sell_vol)
+                self.last_current_position = current_position
+            
+            # 成交对手方统计
+            self.log.info(f"跟22账号成交数量:{self.role22} 策略自成交:{self.roleself} 跟其他用户成交:{self.roleother}")
+            self.role22 = 0
+            self.roleself = 0
+            self.roleother = 0
+            
+        except Exception as e:
+            self.log.warning(f"风控异常:{traceback.format_exc()}")
+    
+    async def update_kline(self):
+        try:
+            kline = await self.bn_rest.fetch_kline(self.symbol, interval='1m', limit=100)
+            for k in kline:
+                self.kline_dict[k['timestamp']] = [k['high'], k['low']]
+            self.kline_price = list(self.kline_dict.values())
+        except:
+            pass
+    
+    # 档持仓有变化后更新偏移量。范围在-1到1之间。-1表示开满空仓,1表示开满多仓
+    async def update_deviation(self, current_position, open_buy_vol, open_sell_vol):
+        current_position *= self.symbol_unit
+        self.base_position = self.base_balance/self.trade_price*self.leverage
+        self.deviation = max(-1, min(1, current_position/self.base_position))
+        self.log.info(f"偏差:{self.deviation} self.base_position:{self.base_position} base_balance:{self.base_balance} trade_price:{self.trade_price} current_position:{current_position}")
+        await self.update_shape(self.deviation)
+    
+    async def update_shape(self, deviation):
+        self.buy_shape = self.default_shape - max(0, 0.5*deviation)     # 根据持仓的偏移
+        self.sell_shape = self.default_shape - max(0, -0.5*deviation)
+    
+    # 根据1minK线调整摆盘每档的价差
+    async def update_range(self, tag='timer'):
+        high_price = [p[0] for p in self.kline_price[-3:]]
+        low_price = [p[1] for p in self.kline_price[-3:]]
+        if tag == 'timer':
+            RH_Time = max(high_price)
+            RL_Time = min(low_price)
+            # 每秒驱动计算
+            RH_Time = max(self.refer_price, 0.01 * self.refer_price + 0.99 * RH_Time)
+            RL_Time = min(self.refer_price, 0.01 * self.refer_price + 0.99 * RL_Time)
+            self.time_band_f = RH_Time - RL_Time
+        elif tag == 'shock':
+            RH_shock = max(high_price)
+            RL_shock = min(low_price)
+            RH_shock = max(self.refer_price, 0.01 * self.refer_price+0.99 * RH_shock)
+            RL_shock = min(self.refer_price, 0.01 * self.refer_price+0.99 * RL_shock)
+            self.shock_band_f = RH_shock - RL_shock
+        time_band_f = self.time_band_f if getattr(self, 'time_band_f', 0) else self.shock_band_f
+        shock_band_f = self.shock_band_f if getattr(self, 'shock_band_f', 0) else self.time_band_f
+        self.range = max(0.0005 * self.refer_price, time_band_f, shock_band_f)
+        # self.log.info(f"价差来源验证:{self.range} refer_price:{0.0005 * self.refer_price} time_band_f:{time_band_f} shock_band_f:{shock_band_f}")
+
+    # 通过推送的一档盘口计算信号
+    async def signal(self, content):
+        signal1 = 0
+        bid_price = content['bid_price']
+        ask_price = content['ask_price']
+        self.bid1, self.ask1 = bid_price, ask_price
+        bid_vol = content['bid_qty']
+        ask_vol = content['ask_qty']
+
+        signal0 = 1 if bid_vol > ask_vol else -1
+        signal1 = 0.9*self.signal1_last + 0.1*signal0
+        self.signal1_last = signal1
+        signal = 1 if signal1 > 0 else -1
+        if signal != self.signal_last:
+            await self.bid_ask_price(signal)
+            self.signal_last = signal
+    
+    # 计算挂单量
+    async def bid_ask_budget(self):
+        # 初始化
+        high_price = [p[0] for p in self.kline_price[-60:]]
+        low_price = [p[1] for p in self.kline_price[-60:]]
+        RH_S = max(high_price)
+        RL_S = min(low_price)
+
+        # 用最新成交价格计算
+        RH_S = max(self.trade_price, 0.01 * self.trade_price + 0.99 * RH_S)
+        RL_S = min(self.trade_price, 0.01 * self.trade_price + 0.99 * RL_S)
+
+        time_band_s = RH_S - RL_S
+        # 半衰期1.5 hr 的波动区间
+        deviation = getattr(self, 'deviation', 0)
+        buy_budget_adj = min(self.max_budget_utilization, math.sqrt(self.range/time_band_s)) * (1-deviation**3)
+        sell_budget_adj = min(self.max_budget_utilization, math.sqrt(self.range/time_band_s)) * (1+deviation**3)
+        # print(f"验证sell_target_cum_qty数据:max_budget_utilization:{self.max_budget_utilization} self.range:{self.range} time_band_s:{time_band_s} deviation:{deviation}")
+
+        # 当前账户usdt权益/标记价格*最大杠杆*buy_budget_adj调整值
+        self.buy_budget = max(0, self.leverage*buy_budget_adj*self.base_balance/self.trade_price)
+        self.sell_budget = max(0, self.leverage*sell_budget_adj*self.base_balance/self.trade_price)
+        # print(f"验证sell_target_cum_qty数据:self.leverage:{self.leverage} sell_budget_adj:{sell_budget_adj} self.base_balance:{self.base_balance} self.trade_price:{self.trade_price}")
+
+    ''' ==========================================================================='''
+    ''' ==================================== main ================================='''
+    ''' ==========================================================================='''
+
+    # step 1 计算价格往后躲多远。发生价格冲击后调用这个函数
+    async def update_shock_dodge(self, bp: BpRow):
+        open_price = bp.open_price
+        close_price = bp.close_price
+        if open_price == -1 or close_price == -1:   # 这一行导致价差越来越大
+            return
+
+        # 只有产生冲击,才会驱动来计算shock_dodge,驱动spread 计算
+        shock_impact = close_price - open_price
+        shock_dodge = max(close_price * 0.00004, \
+                         0.9*self.shock_dodge_last + 0.1* abs(shock_impact), \
+                         0.99*self.shock_dodge_last + 0.01* abs(shock_impact))
+        temp = self.shock_dodge_last
+        self.shock_dodge_last = shock_dodge
+        await asyncio.gather(self.bid_ask_spread(shock_dodge), \
+                             self.update_range('shock'))
+
+    # step 2 算出来我们的盘口价格。每次binance成交调用这个函数
+    async def update_benchmark_price(self, content):
+        self.trade_ts = content[0]
+        self.trade_price = content[1]
+        self.trade_side = content[-1]
+        # 用trade驱动
+        self.refer_price = self.trade_price if self.refer_price == 0 else self.refer_price
+        # 跟上一次价格偏差超过1%则忽略
+        if abs(self.trade_price/self.refer_price -1) > 0.01:
+            return
+        else:
+            trade_price = self.trade_price
+        
+        # 驱动决策
+        self.benchmark_ask_price = getattr(self, 'benchmark_ask_price', trade_price)    # 以最新成交作为初始值
+        self.benchmark_bid_price = getattr(self, 'benchmark_bid_price', trade_price)
+        if self.trade_side == 1:    # buy
+            self.sell_shocking = 0
+            if (trade_price - self.benchmark_ask_price) > self.min_price_step:
+                self.benchmark_ask_price = trade_price + self.shock_dodge_last
+                self.buy_shocking = 1
+                await self.bid_ask_price(self.signal_last)
+            if (trade_price - self.benchmark_ask_price) < -self.min_price_step and self.buy_shocking == 0:
+                self.benchmark_ask_price = trade_price
+                await self.bid_ask_price(self.signal_last)
+        # 驱动对冲
+        elif self.trade_side == -1: # sell
+            self.buy_shocking = 0
+            if (trade_price - self.benchmark_bid_price) < -self.min_price_step:
+                self.benchmark_bid_price = trade_price - self.shock_dodge_last
+                self.sell_shocking = 1
+                await self.bid_ask_price(self.signal_last)
+            if (trade_price - self.benchmark_bid_price) > self.min_price_step and self.sell_shocking == 0:
+                self.benchmark_bid_price = trade_price
+                await self.bid_ask_price(self.signal_last)
+        self.refer_price = trade_price    # 上一次价格
+        
+    # Step 3 计算bid/ask price
+    async def bid_ask_price(self, signal):
+        if self.buy_shocking != 0 or self.sell_shocking != 0:
+            return
+        bid_price= self.benchmark_bid_price*(1+0.00004*signal) - self.bid_spread
+        ask_price= self.benchmark_ask_price*(1+0.00004*signal) + self.ask_spread
+        
+        # websea最新盘口数据
+        bid1_wb = self.bid1_wb
+        ask1_wb = self.ask1_wb
+        self.bid_price_adj = max(bid_price*(1-self.taker_fee), \
+                                 min(ask1_wb-self.min_price_step, (1-self.maker_fee)*bid_price))
+        self.ask_price_adj = min(ask_price*(1+self.taker_fee), \
+                                 max(bid1_wb+self.min_price_step, (1+self.maker_fee)*ask_price))
+        
+        if not self.main_clock:
+            try:
+                await self.main('bid_ask_price函数')   # 去下单
+                self.main_clock = False
+            except:
+                self.main_clock = False
+                self.log.warning(f"main error:{traceback.format_exc()}")
+        else:
+            pass
+        
+    # step 4 计算bid、ask的价差
+    async def bid_ask_spread(self, shock_dodge):
+        # 价格冲击后计算shock dodge ——> 计算spread
+        self.ask_spread = shock_dodge
+        self.bid_spread = shock_dodge
+        
+    async def main(self, source=''):
+        self.main_clock = True
+        open_buy_list = []      # buy当前委托
+        open_sell_list = []     # sell当前委托
+        to_cancel_list = []     # 保存撤单的order_id
+        cancel_buy_list = []    # 保存撤单的index
+        cancel_sell_list = []
+
+        for order in self.local_open_buy_list:
+            if order[0] > self.bid_price_adj:
+                to_cancel_list.append(order[1])
+                cancel_buy_list.append(order)
+            else:
+                open_buy_list.append(order)
+        for order in self.local_open_sell_list:
+            if order[0] < self.ask_price_adj:
+                to_cancel_list.append(order[1])
+                cancel_sell_list.append(order)
+            else:
+                open_sell_list.append(order)
+        
+        for i in cancel_buy_list:
+            self.local_open_buy_list.remove(i)
+        for i in cancel_sell_list:
+            self.local_open_sell_list.remove(i)
+        
+        if to_cancel_list:
+            self.log.info(f"因价格撤近端buy:{cancel_buy_list} 共:{len(cancel_buy_list)}笔")
+            self.log.info(f"因价格撤近端sell:{cancel_sell_list} 共:{len(cancel_sell_list)}笔")
+            await self.cancel_orders(to_cancel_list, '因价格撤近端')
+        
+        # 补 or 撤单
+        await self.bid_ask_budget()     # 更新挂单量
+        sell_target_cum_qty = 0         # sell当前档位之前所有档的累计挂单量
+        sell_sending_sum_qty = 0
+        buy_target_cum_qty = 0          # buy当前档位之前所有档的累计挂单量
+        buy_sending_sum_qty = 0
+        sell_target_add = 1 / self.place_num * self.sell_budget     # 每一档挂单量
+        buy_target_add = 1 / self.place_num * self.buy_budget       # 每一档挂单量
+        # self.vol_log.write(f"buy_target_add来源:self.buy_budget:{self.buy_budget}")
+        to_sell_create_orders = {}   # sell本次循环要新挂的订单
+        to_buy_create_orders = {}    # buy本次循环要新挂的订单
+        to_cancel_orders = []        # buy和sell放一起
+        cancel_buy_list = []
+        cancel_sell_list = []
+        buy_price_last = 0           # 上一次buy的价格
+        sell_price_last = 0          # 上一次sell的价格
+        max_open_buy, min_open_sell = 0, 0
+        if [i[0] for i in self.local_open_buy_list]:
+            max_open_buy = max([i[0] for i in self.local_open_buy_list])
+        if [i[0] for i in self.local_open_sell_list]:
+            min_open_sell = min([i[0] for i in self.local_open_sell_list])
+
+        # 测试数据
+        for num in range(1, self.place_num+1):
+            # buy_shape是根据持仓调整价差;range是根据价格波动调整价差
+            buy_price = self.bid_price_adj - (num / (self.place_num-1)) ** self.buy_shape * self.range
+            sell_price = self.ask_price_adj + (num / (self.place_num-1)) ** self.sell_shape * self.range
+            if num == 1:
+                print(f"一档价差:{round((sell_price-buy_price)/buy_price*100, 2)}%")
+            # print(f"缩小价差:buy_price:{buy_price} sell_price:{sell_price} bid_price_adj:{self.bid_price_adj} ask_price_adj:{self.ask_price_adj} buy_shape:{self.buy_shape} sell_shape:{self.sell_shape} range:{self.range}")
+            buy_target_cum_qty = (num + 0.5*self.place_num) / (self.place_num + 0.5*self.place_num) * self.buy_budget  # 这里是buy累计的挂单量
+            sell_target_cum_qty = (num + 0.5*self.place_num) / (self.place_num + 0.5*self.place_num) * self.sell_budget  # 这里是sell累计的挂单量
+            sell_cum_qty = 0    # sell需要撤单的总量
+            buy_cum_qty = 0     # buy需要撤单的总量
+            for i in range(len(open_sell_list)):
+                if open_sell_list[i][0] <= sell_price:
+                    sell_cum_qty += open_sell_list[i][2]
+            for i in range(len(open_buy_list)):
+                if open_buy_list[i][0] >= buy_price:
+                    buy_cum_qty += open_buy_list[i][2]
+            # 需要撤单的量+新挂的量
+            sell_cum_qty_adj = sell_cum_qty + sell_sending_sum_qty
+            buy_cum_qty_adj = buy_cum_qty + buy_sending_sum_qty
+
+            # 处理sell数据
+            # gap(本次应该挂的量)=到num这一档之前的累计挂单量-(需要撤单的量+新挂的量)
+            sell_gap = sell_target_cum_qty - sell_cum_qty_adj
+            if sell_gap >= max((0.5+0.5*(self.frequency_controller-1))*sell_target_add, self.symbol_unit):
+                # to_sell_qty = round(sell_gap)    # 精度优化
+                to_sell_qty = sell_gap    # 测试数据
+                price = sell_price
+                sell_sending_sum_qty += to_sell_qty
+                if price not in self.local_open_sell_list and \
+                    len(self.local_open_sell_list) < int(self.place_num):
+                    if not max_open_buy:
+                        to_sell_create_orders[price] = to_sell_qty    # 记录下单数据
+                    else:
+                        # print(f"price:{price} > max_open_buy:{max_open_buy} sell不挂单排查")
+                        if price > max_open_buy:
+                            to_sell_create_orders[price] = to_sell_qty    # 记录下单数据
+            elif sell_gap <= -(1+0.3*self.deviation)*sell_target_add:  # 减仓逻辑 对卖
+                # 从sell price_last(不含)向上找3个订单 #对buy 向下
+                temp_sell = [open_sell_list[i] for i in range(len(open_sell_list)) \
+                             if open_sell_list[i][0] > sell_price_last]
+                if temp_sell:
+                    # 对temp_sell从小到大排序
+                    temp_sell.sort(key=lambda x: x[0])
+                    for i in range(min(len(temp_sell), 3)):
+                        sell_sending_sum_qty -= temp_sell[i][2]
+                        to_cancel_orders.append(temp_sell[i][1])  # 记录撤单数据
+                        cancel_sell_list.append(temp_sell[i])
+                        sell_gap += temp_sell[i][2]
+                        if sell_gap >= -(1+0.3*self.deviation)*sell_target_add:
+                            break
+            sell_price_last = sell_price
+            
+            # 处理buy数据
+            buy_gap = buy_target_cum_qty - buy_cum_qty_adj
+            if buy_gap >= max((0.5+0.5*(self.frequency_controller-1))*buy_target_add, self.symbol_unit):
+                # to_buy_qty = round(buy_gap)    # 精度优化
+                to_buy_qty = buy_gap    # 测试数据
+                price = buy_price
+                buy_sending_sum_qty += to_buy_qty
+                if price not in self.local_open_buy_list and \
+                    len(self.local_open_buy_list) < int(self.place_num):
+                    if not min_open_sell:
+                        to_buy_create_orders[price] = to_buy_qty      # 记录下单数据
+                    else:
+                        if price < min_open_sell:
+                            to_buy_create_orders[price] = to_buy_qty      # 记录下单数据
+            elif buy_gap <= -(1-0.3*self.deviation)*buy_target_add:  # 对买
+                temp_buy = [open_buy_list[i] for i in range(len(open_buy_list)) \
+                             if open_buy_list[i][0] < buy_price_last]
+                if temp_buy:
+                    # 对temp_sell从大到小排序
+                    temp_buy.sort(key=lambda x: x[0], reverse=True)
+                    for i in range(min(len(temp_buy), 3)):
+                        buy_sending_sum_qty -= temp_buy[i][2] # 撤单所以要减去
+                        to_cancel_orders.append(temp_buy[i][1])  # 记录撤单数据
+                        cancel_buy_list.append(temp_buy[i])
+                        buy_gap += temp_buy[i][2]
+                        if buy_gap >= -(1-0.3*self.deviation)*buy_target_add:  # 对买
+                            break
+            buy_price_last = buy_price
+            
+        if to_cancel_orders:
+            try:
+                for i in cancel_buy_list:
+                    self.local_open_buy_list.remove(i)
+                for i in cancel_sell_list:
+                    self.local_open_sell_list.remove(i)
+            except:
+                pass
+                # self.log.warning(f"975报错:{traceback.format_exc()}\nsell原始数据:{cancel_sell_list}\n{self.local_open_sell_list}\nbuy原始数据:{cancel_buy_list}\n{self.local_open_buy_list}")
+            self.log.info(f"因数量撤近端buy:{cancel_buy_list} 共:{len(cancel_buy_list)}笔")
+            self.log.info(f"因数量撤近端sell:{cancel_sell_list} 共:{len(cancel_sell_list)}笔")
+            await self.cancel_orders(to_cancel_orders, '因数量撤近端')
+        
+        # 下单
+        # if to_sell_create_orders == {}:
+        #     print(f"sell为0的原因:max_open_buy:{max_open_buy} sell_price:{sell_price} sell_gap:{sell_gap} >= {max((0.5+0.5*(self.frequency_controller-1))*sell_target_add, self.symbol_unit)} sell_gap:{sell_gap} sell_target_cum_qty:{sell_target_cum_qty} sell_cum_qty:{sell_cum_qty} sell_sending_sum_qty:{sell_sending_sum_qty}")
+        temp_create_buy = {}
+        for p, v in to_buy_create_orders.items():
+            if p < self.bn_bid_price:
+                price = round(p, self.price_unit)
+                vol = round(v, self.amount_unit)
+                temp_create_buy[price] = vol
+        temp_create_sell = {}
+        for p, v in to_sell_create_orders.items():
+            if p > self.bn_ask_price:
+                price = round(p, self.price_unit)
+                vol = round(v, self.amount_unit)
+                temp_create_sell[price] = vol
+        to_buy_create_orders = temp_create_buy
+        to_sell_create_orders = temp_create_sell
+        temp_buy = sorted([p for p,v in to_buy_create_orders.items()], reverse=True)
+        temp_sell = sorted([p for p,v in to_sell_create_orders.items()], reverse=False)
+        # self.log.info(f"最新成交:{self.trade_price}\n外盘一档价格:{self.bn_bid_price} {self.bn_ask_price}\n下单价格buy:{temp_buy}\nsell:{temp_sell}\n当前盘口价格:{self.bid1_wb} {self.ask1_wb}")
+        try:
+            if temp_buy[0] > self.bn_bid_price or temp_buy[0] > self.bid1_wb:
+                self.log.info(f"buy定价错误:最新下单价:{temp_buy[0]} 外盘:{self.bn_bid_price} 内盘:{self.bid1_wb}")
+            if temp_sell[0] < self.bn_ask_price or temp_sell[0] < self.ask1_wb:
+                self.log.info(f"sell定价错误:最新下单价:{temp_sell[0]} 外盘:{self.bn_ask_price} 内盘:{self.ask1_wb}")
+        except:
+            pass
+        if to_buy_create_orders or to_sell_create_orders:
+            await asyncio.gather(self.make_order(to_buy_create_orders, 'BUY'), \
+                                 self.make_order(to_sell_create_orders, 'SELL'))
+        
+        # 撤远单:
+        cancel_buy_list = []
+        cancel_sell_list = []
+        # 按数量撤单
+        # 在open buy list 中, if order num按price排序(从大到小),剔除后 self.place_num* 1.3名外的订单
+        # 在open sell list 中,if order num按price排序(从小到大),剔除后 self.place_num* 1.3名外的订单
+        # 按价格撤单
+        # 在open buy list 中，撤 price < 0.999 * base price - buy range的订单
+        # 在open sell list 中，撤 price > 1.001 * base price + sell range的订单
+        open_buy_list = sorted(open_buy_list, key=lambda x: x[0], reverse=True)     # 从大到小排序
+        open_sell_list = sorted(open_sell_list, key=lambda x: x[0], reverse=False)  # 从小到大排序
+        far_to_cancel_list = []
+        price_cancel_list = []
+        num_cancel_list = []
+        for i in open_buy_list:
+            if i[0] < (1-self.cancel_price_ratio) * self.trade_price - self.range:
+                price_cancel_list.append(i[1])
+                cancel_buy_list.append(i)
+        for i in open_sell_list:
+            if i[0] > (1+self.cancel_price_ratio) * self.trade_price + self.range:
+                price_cancel_list.append(i[1])
+                cancel_sell_list.append(i)
+        for i in open_buy_list[int(self.place_num/2*1.3):]:
+            num_cancel_list.append(i[1])
+            cancel_buy_list.append(i)
+        for i in open_sell_list[int(self.place_num/2*1.3):]:
+            num_cancel_list.append(i[1])
+            cancel_sell_list.append(i)
+        far_to_cancel_list = price_cancel_list + num_cancel_list
+        
+        if far_to_cancel_list:
+            await self.cancel_orders(far_to_cancel_list, '撤远端')
+            try:
+                for i in cancel_buy_list:
+                    self.local_open_buy_list.remove(i)
+                for i in cancel_sell_list:
+                    self.local_open_sell_list.remove(i)
+            except:
+                pass
+        self.main_clock = False
+
+    async def make_order(self, grid_list, side, tag=''):
+        return
+        side = 'buy' if side == 'BUY' else 'sell'
+        order_dict = {}
+        order_list = []
+        con1 = side == 'buy' and self.buy_is_open
+        con2 = side == 'sell' and self.sell_is_open
+        reduce_only = False if con1 or con2 else True
+        for price, vol in grid_list.items():
+            vol = int(vol/self.symbol_unit)
+            tp = self.ask1_wb if side == 'BUY' else self.bid1_wb
+            random_tag = random.randint(100000, 999999)
+            order_dict = {'client_order_id': f'{int(time.time()*1000)}{side}{random_tag}',
+                            'side': side,
+                            'price': 0.1,
+                            'amount': 100,
+                            'leverage': 5,
+                            'reduce_only': reduce_only,
+                            'margin_mode': 'crossed',
+                            'deal_type': 'GTC',  # IOC,FOK,PO
+                            'ice_amount': 0}
+            order_list.append(order_dict)
+        self.log.info(f"{side}开仓信息:{order_list}")
+        if order_list == []:
+            return
+        try:
+            if side == 'buy':
+                if self.buy_is_open:
+                    res = await self.rest.create_order_batch(self.symbol, *order_list)
+                else:
+                    res = await self.rest.create_order_batch(self.symbol, *order_list)
+            elif side == 'sell':
+                if self.sell_is_open:
+                    res = await self.rest.create_order_batch(self.symbol, *order_list)
+                else:
+                    res = await self.rest.create_order_batch(self.symbol,*order_list)
+            if side == 'BUY':
+                for i in order_list:
+                    self.local_open_buy_list.append([i['price'], i['client_order_id'], i['amount']*self.symbol_unit])
+            else:
+                for i in order_list:
+                    self.local_open_sell_list.append([i['price'], i['client_order_id'], i['amount']*self.symbol_unit])
+            self.log.info(f"{side}下单回报:{res}")
+        except Exception as e:
+            self.log.warning(f"{tag} {self.symbol}-{side}-{price}-{vol} 下单错误: {traceback.format_exc()}")
+    
+
+
+def main(config):
+    strategy(config).run()
+
+
+if __name__ == '__main__':
+    main(sys.argv[1])
+
+
+
