@@ -1,0 +1,175 @@
+
+import sys
+import datetime
+import traceback
+import asyncio
+import mysql.connector
+sys.path.append('../..')
+from utils import Toolbox as tb
+from template.template_timer import TemplateTimer, CronTrigger
+from client.env_pro.rest.websea.contract import WebseaContract as ws_contract_rest
+from crypto_center.client.rest.okex import contract as okx_rest
+from utils import restclient as rc
+
+class Strategy(TemplateTimer):
+
+    ''' ============================================================================'''
+    ''' =================================== init ==================================='''
+    ''' ============================================================================'''
+
+    def __init__(self):
+        super().__init__(scheduler=True, gcc=True)
+        self.loop = asyncio.get_event_loop()
+        self.rc_task = rc.RestClient()
+        self.account_id = 'e1934f97'
+        self.ws_rest = ws_contract_rest('343d6405c5bceb820d47c502a3357775','9lbvo1ti1jlznd3czjwp')
+        self.okx_rest = okx_rest.OkexContract('e1934f97-f831-418e-b154-1ec5a0415f9a','A2D8A15D0DE4B59BD7B270A34BB1273C','usRolUVNuyBbEF@7 ')
+        self.okx_rest2 = okx_rest.OkexContract('b1c2b6e5-daf6-4ce4-8198-96aee61c3b17','E26B8728F3F85FED0451AB50F3CD1A25','Tbtb794972.')
+        self.okx_rest3 = okx_rest.OkexContract('b29736e4-6a9b-4a29-ba07-048d75703924','9E0648BE0E41C21C857C93D1CF4F2588','Tbtb794972.')
+        self.tasks = {'e193_带单包赔策略': [self.okx_rest, 'okx_hedge_balance', '超短线-mike'], 
+                      'b1c2_实时对冲策略': [self.okx_rest2, 'okx_hedge_balance2', 'Z2组高胜率用户535229'],
+                      'b297_网格对冲策略': [self.okx_rest3, 'okx_hedge_balance3', 'Z组长期持仓用户478061']}
+        self.new_mike = 56460       # 485142初始权益
+        self.new_Z = 29024          # 478061
+        self.new_Z2 = 1586          # 535229
+        self.yesterday_mike = self.new_mike # 昨天0点权益
+        self.yesterday_Z = self.new_Z
+        self.yesterday_Z2 = self.new_Z2
+        
+    async def on_first(self):
+        # await self.save_mysql()
+        pass
+
+    async def on_timer(self):
+        self.log.info("=======timer======")
+        self.schedule.add_job(self.save_mysql, CronTrigger(hour="*"))
+        self.schedule.add_job(self.fetch_base_balance, CronTrigger(minute="*/2"))
+    
+    # 连接数据库
+    async def connect_db(self):
+        self.db = mysql.connector.connect(
+            host="abc-mysql-instance-1.cr8a0xsju0u1.ap-southeast-1.rds.amazonaws.com",
+            user="contract_user",
+            password="}jnB+wZ#EgmUpob",
+            database="contract_db",
+            port=3306  # 默认端口
+        )
+        self.cursor = self.db.cursor()
+        
+    async def fetch_base_balance(self):
+        for id in [485142, 478061, 535229]:
+            while 1:
+                try:
+                    res = await self.ws_rest.hold_list(token='c1cf4185b2bed317aeb6e6674491fbef', page_size=20, user_id=id)  # Z组478061
+                    res = res['data']['data']
+                    break
+                except:
+                    pass
+                await asyncio.sleep(5)
+            if res != []:
+                if id == 485142:
+                    self.new_mike = float(res[0]['zhqy'])
+                    if self.yesterday_mike == 0:
+                        self.yesterday_mike = self.new_mike
+                elif id == 478061:
+                    self.new_Z = float(res[0]['zhqy'])
+                    if self.yesterday_Z == 0:
+                        self.yesterday_Z = self.new_Z
+                elif id == 535229:
+                    self.new_Z2 = float(res[0]['zhqy'])
+                    if self.yesterday_Z2 == 0:
+                        self.yesterday_Z2 = self.new_Z2
+                print(f"{datetime.datetime.now()} {id}账户权益:{res[0]['zhqy']}")
+
+        
+    async def get_balance(self, name, task):
+        res = await task.fetch_balance()
+        balance = int(res['USDT']['total'])
+        free = int(res['USDT']['free'])
+        frozen = int(res['USDT']['used'])
+        ts = datetime.datetime.now()
+        # 把持仓浮动盈亏加上
+        pos = await task.fetch_position()
+        pos_profit = 0
+        for i in pos:
+            pos_profit += i['unrealizedPnl']
+        print(f"{name}权益:{balance}, 持仓浮动盈亏:{pos_profit}, 可用:{free}, 冻结:{frozen}, 时间:{ts}")
+        save_sql_data = [(self.account_id, round(balance+pos_profit,2), free, frozen, ts)]
+        return save_sql_data
+        
+    # 对冲
+    async def save_mysql(self):
+        all_mess = ''
+        for name, task in self.tasks.items():
+            save_sql_data = await self.get_balance(name, task[0])
+            table_name = task[1]    # mysql表格名称
+            user_name = task[2]     # 策略名称
+            
+            await self.connect_db()
+            # 每日0点发送对冲账户权益到tg群 内容:前一天净值、当天净值、盈亏、对冲的是谁
+            try:
+                date_hour = datetime.datetime.now().hour
+                if date_hour == 16:
+                    # 查询table_name表中24小时前的数据
+                    self.cursor.execute(f"SELECT * FROM {table_name}")
+                    row = self.cursor.fetchall()[-25:-24]
+                    if user_name == '超短线-mike':
+                        base_profit = self.new_mike - self.yesterday_mike
+                        self.yesterday_mike = 0
+                    elif user_name == 'Z组长期持仓用户478061':
+                        base_profit = self.new_Z - self.yesterday_Z
+                        self.yesterday_Z = 0
+                    elif user_name == 'Z2组高胜率用户535229':
+                        base_profit = self.new_Z2 - self.yesterday_Z2
+                        self.yesterday_Z2 = 0
+                    
+                    # mess = f"{user_name}对冲策略 昨日0点权益:{float(row[0][2])} 今日0点权益:{save_sql_data[0][1]} 盈亏:{round(save_sql_data[0][1]-float(row[0][2]), 2)}" \
+                    #        f" 对应内盘用户的盈亏:{int(base_profit)}"
+                    mess = f"{user_name}对冲策略\n昨日0点权益:{float(row[0][2])}\n今日0点权益:{save_sql_data[0][1]}\n盈亏:{round(save_sql_data[0][1]-float(row[0][2]), 2)}\n" \
+                        f"对应内盘用户的盈亏:{int(base_profit)}\n=================================\n"
+                    print(mess)
+                    all_mess += mess
+                    # -4574197143量化风控部群  我自己的机器人1843312449
+                    # await self.rc_task.tg_warning(token='6431006677:AAFPjHsu3ZiowA8vyKYPmK8-b-XSPnBUu3Q', chat_id=1843312449, content=mess)
+                    # await self.rc_task.tg_warning(token='6431006677:AAFPjHsu3ZiowA8vyKYPmK8-b-XSPnBUu3Q', chat_id=-4574197143, content=mess)
+            except:
+                mess = f"{datetime.datetime.now()} 发送对冲账户权益到tg群失败,报错:{traceback.format_exc()}"
+                print(mess)
+                tb.warning(mess, 'risk')
+                tb.sendmail(f'发送tg每日权益失败', mess)
+
+            try:
+                insert_sql = f"INSERT INTO {table_name} (account_id, balance, free, frozen, created_at) VALUES (%s, %s, %s, %s, %s)"
+                print(f"保存数据:{insert_sql}\n{save_sql_data}")
+                # 批量插入
+                self.cursor.executemany(insert_sql, save_sql_data)
+                self.db.commit()  # 提交事务
+            except:
+                mess = f"{datetime.datetime.now()} 对冲账户权益数据保存mysql失败,报错:{traceback.format_exc()}"
+                print(mess)
+                tb.warning(mess, 'risk')
+                tb.sendmail(f'对冲账户权益保存mysql失败', mess)
+
+        #     try:
+        #         # 查询表信息
+        #         self.cursor.execute(f"SELECT * FROM {table_name}")
+        #         print(f"{datetime.datetime.now()} 查询mysql对冲账户权益数据:")
+        #         for row in self.cursor.fetchall()[-10:]:
+        #             print(row)
+        #     except:
+        #         mess = f"{datetime.datetime.now()} 对冲账户权益数据保存mysql失败,报错:{traceback.format_exc()}"
+        #         print(mess)
+        #         tb.warning(mess, 'risk')
+        #         tb.sendmail(f'对冲账户权益保存mysql失败', mess)
+        if all_mess != '':
+            #await self.rc_task.tg_warning(token='6431006677:AAFPjHsu3ZiowA8vyKYPmK8-b-XSPnBUu3Q', chat_id=-4574197143, content=all_mess)
+            await self.rc_task.tg_warning(token='6431006677:AAFPjHsu3ZiowA8vyKYPmK8-b-XSPnBUu3Q', chat_id=-4893618309, content=all_mess)
+        self.db.close()  # 关闭数据库连接
+         
+        
+    
+if __name__ == '__main__':
+    Strategy().run()
+
+
+
